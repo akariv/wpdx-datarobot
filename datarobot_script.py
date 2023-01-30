@@ -259,8 +259,8 @@ def do_predictions(country_codes, training_path, prediction_path, validation_pat
                 print('AUTOPILOT DONE')
 
                 #model: dr.Model = dr.ModelRecommendation.get(project.id).get_model()
-                leaderboard_top = get_top_of_leaderboard(project, metric="AUC", feature_list=feature_list.name) #get best model from reduced feature list
-                model: dr.Model = project.get(project=project.id, model_id=leaderboard_top.iloc[0]["model_id"] #gets the best   
+                leaderboard_top = get_top_of_leaderboard(project, metric="AUC", feature_list=feature_list.name) #get best model from reduced feature list,name space is repeated in the loop..
+                model: dr.Model = project.get(project=project.id, model_id=leaderboard_top.iloc[0]["model_id"] #gets the best model from the new feature list 
                                           
                 project.start_prepare_model_for_deployment(model_id=model.id)
                 models[country_code] = model
