@@ -75,10 +75,16 @@ def assign_folds(fold_counts):
 
 def assign_holdout(total_count):
     def func(rows):
-        for i, row in enumerate(rows):
-            if i >= total_count * 0.85:
+        cur_fold = None
+        i = 0
+        for row in rows:
+            if cur_fold != row['fold']:
+                cur_fold = row['fold']
+                i = 0
+            if i >= total_count * 0.17:
                 row['fold'] = -1
             yield row
+            i += 1
     return func
 
 
@@ -102,7 +108,30 @@ def apply_type_transforms(project: dr.Project, fl: dr.Featurelist):
             else f 
             for f in fl.features]
     )
+
+
+def get_top_of_leaderboard(project: dr.Project, feature_list=None):
+    metric = 'AUC'
+    reverse = True
+    print('GET TOP OF LEADERBOARD ({}, {}):'.format(project.id, feature_list))
+    leaderboard = []
+    for m in project.get_models():
+        if m.sample_pct < 85 and feature_list in (m.featurelist.id, None):
+            if not m.metrics[metric]["crossValidation"]:
+                mj = m.cross_validate()
+                m = mj.get_result_when_complete(max_wait=3600)
+                m = dr.Model.get(m.project_id, m.id)
+            if m.metrics[metric]["crossValidation"]:
+                leaderboard.append((m.metrics[metric]["crossValidation"], m.id))
+        print('\t{}: pct: {}, fl: {}, AUC metrics: {!r}, frozen: {!r}'.format(
+            m.id, m.sample_pct, m.featurelist.id, m.metrics[metric], m.is_frozen
+        ))
+        if len(leaderboard) == 10:
+            break
     
+    assert len(leaderboard) > 0, 'No models found for project {} and fl {}'.format(project.id, feature_list)
+
+    return sorted(leaderboard, reverse=reverse)[0][1]
 
 def do_predictions(country_codes, training_path, prediction_path, validation_path, base_path, years_range):
     output_path = base_path + 'prediction_map/'
@@ -137,7 +166,7 @@ def do_predictions(country_codes, training_path, prediction_path, validation_pat
     prediction_prep = dict()
 
     # TRAINING THE MODEL
-    for country_code in ['all'] + country_codes:
+    for country_code in country_codes + ['all']:
         print(f'TRAINING FOR {country_code}')
         outdir = TMPDIR / country_code
 
@@ -147,17 +176,17 @@ def do_predictions(country_codes, training_path, prediction_path, validation_pat
             # DF.checkpoint('prediction'),
             DF.filter_rows(lambda r: country_code in ('all', r['clean_country_id'])),
             DF.add_field('mangled_id', 'string', lambda r: hasher(r['wpdx_id'])),
-            DF.sort_rows('{clean_adm1}{clean_adm2}{mangled_id}'),
+            DF.sort_rows('{clean_country_id}{clean_adm1}{clean_adm2}{mangled_id}'),
             assign_folds(fold_counts),
             # DF.printer(),
-            DF.sort_rows('{report_date}'),
+            DF.sort_rows('{fold}{report_date}'),
             assign_holdout(total_count),
             DF.delete_fields(['lat_deg', 'lon_deg', 'mangled_id']),
             DF.update_resource(-1, path=training_outfile),
             DF.dump_to_path(outdir / 'training'),
         ).process()
         fields = [f.name for f in dp.resources[0].schema.fields]
-        fields = [f for f in fields if f not in ('fold', 'wpdx_id', 'report_date', 'clean_country_id', 'clean_adm1', 'clean_adm2')]
+        fields = [f for f in fields if f not in ('fold', 'wpdx_id', 'report_date', 'clean_country_id', 'clean_adm1', 'clean_adm2', 'unified_install_year')]
         
         prediction_outfile = f'data/{country_code}_prediction_water_points.csv'
         rows = DF.Flow(
@@ -216,7 +245,7 @@ def do_predictions(country_codes, training_path, prediction_path, validation_pat
                 )
                 project.analyze_and_model(
                     target='status_id',
-                    mode=dr.enums.AUTOPILOT_MODE.QUICK,
+                    mode=dr.enums.AUTOPILOT_MODE.FULL_AUTO,
                     advanced_options=advanced_options,
                     partitioning_method=dr.UserCV('fold', -1, seed=0),
                     featurelist_id=feature_list.id,
@@ -225,40 +254,58 @@ def do_predictions(country_codes, training_path, prediction_path, validation_pat
                 project.wait_for_autopilot()
                 print('ANALYZE DONE')
 
-                m: dr.Model = project.get_top_model()
+                leaderboard_top = get_top_of_leaderboard(project)
+                m: dr.Model = dr.Model.get(project=project.id, model_id=leaderboard_top)
+
+                candidates = []
                 top_features = m.get_or_request_feature_impact()
-                while len(top_features) > 10:
+                while len(top_features) > (35 if country_code == 'all' else 20):
                     print('REMOVING FEATURES, CURRENTLY {} FEATURES: {}...{}'.format(len(top_features), top_features[0], top_features[-1]))
                     n = len(top_features) - 1
                     top_features = top_features[:n]
                     new_fl = project.create_featurelist(feature_list.name + f'-{n}', [f['featureName'] for f in top_features])
                     mj = m.retrain(featurelist_id = new_fl.id)
-                    m = mj.get_result_when_complete()
+                    m = mj.get_result_when_complete(max_wait=3600)
                     m = dr.Model.get(m.project_id, m.id)
-                    m.cross_validate()
+                    mj = m.cross_validate()
+                    m = mj.get_result_when_complete(max_wait=3600)
+                    m = dr.Model.get(m.project_id, m.id)
+                    if m.metrics['AUC']['holdout'] and m.metrics['AUC']['crossValidation']:
+                        candidates.append((m.id, new_fl.id, n, m.metrics['AUC']['holdout'], m.metrics['AUC']['crossValidation']))
+                    else:
+                        print('SKIPPING MODEL, MISSING METRICS: {}'.format(m.metrics))
+
                     top_features = m.get_or_request_feature_impact()
                 feature_list = new_fl
                 print('FINAL FEATURES: {}'.format(top_features))
+                assert len(candidates) > 0
+                print('NUM OF CANDIDATES: {}'.format(len(candidates)))
 
-                advanced_options.prepare_model_for_deployment = True
-                project.analyze_and_model(
-                    target='status_id',
-                    mode=dr.enums.AUTOPILOT_MODE.COMPREHENSIVE,
-                    advanced_options=advanced_options,
-                    partitioning_method=dr.UserCV('fold', -1, seed=0),
-                    featurelist_id=feature_list.id,
-                    worker_count=-1,
-                )
+                max_m1 = max(candidates, key=lambda c: c[3])
+                max_m2 = max(candidates, key=lambda c: c[4])
+                fl_candidates = [c for c in candidates if c[3] >= max_m1[3]*0.95 and c[4] >= max_m2[4]*0.95]
+                top_fl_candidate = min(fl_candidates, key=lambda c: c[2])[1]
+                print('TOP FEATURE LIST: {}'.format(top_fl_candidate))
+
+                project.start_autopilot(top_fl_candidate, mode=dr.enums.AUTOPILOT_MODE.COMPREHENSIVE)
                 project.wait_for_autopilot()
                 print('AUTOPILOT DONE')
 
-                model: dr.Model = dr.ModelRecommendation.get(project.id).get_model()
+                leaderboard_top = get_top_of_leaderboard(project, feature_list=top_fl_candidate)
+                model: dr.Model = dr.Model.get(project=project.id, model_id=leaderboard_top)
+                project.start_prepare_model_for_deployment(model_id=model.id)
                 models[country_code] = model
                 print('MODEL: {}'.format(model))
             except Exception as e:
                 print(f'ERROR PREDICTING FOR {country_code}: {e}')
                 logger.exception(e)
                 continue
+
+
+    # # Find the threshold that maximizes F1 score
+    # roc = model.get_roc_curve('holdout')
+    # pred_threshold = roc.get_best_f1_threshold()
+    # print(pred_threshold)
 
     # VALIDATING THE MODELS
     for country_code in country_codes:
