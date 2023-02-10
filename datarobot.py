@@ -253,9 +253,10 @@ def do_predictions(country_codes, training_path, prediction_path, validation_pat
                 )
                 project.wait_for_autopilot()
                 print('ANALYZE DONE')
-
                 leaderboard_top = get_top_of_leaderboard(project)
                 m: dr.Model = dr.Model.get(project=project.id, model_id=leaderboard_top)
+
+                project.unlock_holdout()
 
                 candidates = []
                 top_features = m.get_or_request_feature_impact()
@@ -265,10 +266,10 @@ def do_predictions(country_codes, training_path, prediction_path, validation_pat
                     top_features = top_features[:n]
                     new_fl = project.create_featurelist(feature_list.name + f'-{n}', [f['featureName'] for f in top_features])
                     mj = m.retrain(featurelist_id = new_fl.id)
-                    m = mj.get_result_when_complete(max_wait=3600)
+                    m = mj.get_result_when_complete(max_wait=3600*24)
                     m = dr.Model.get(m.project_id, m.id)
                     mj = m.cross_validate()
-                    m = mj.get_result_when_complete(max_wait=3600)
+                    m = mj.get_result_when_complete(max_wait=3600*24)
                     m = dr.Model.get(m.project_id, m.id)
                     if m.metrics['AUC']['holdout'] and m.metrics['AUC']['crossValidation']:
                         candidates.append((m.id, new_fl.id, n, m.metrics['AUC']['holdout'], m.metrics['AUC']['crossValidation']))
